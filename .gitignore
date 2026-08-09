@@ -1,0 +1,27 @@
+# Virtual environment
+.venv/
+venv/
+
+# Runtime data — all of it is re-downloadable from public sources
+data/
+logs/
+tools/
+
+# Local configuration
+.env
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+build/
+dist/
+
+# Editors and OS
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
