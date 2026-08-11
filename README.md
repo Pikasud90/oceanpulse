@@ -47,12 +47,13 @@ end.
 19. [The math engine](#19-the-math-engine)
 20. [Aggregation and export semantics](#20-aggregation-and-export-semantics)
 21. [Design decisions and trade-offs](#21-design-decisions-and-trade-offs)
-22. [Resilience and error handling](#22-resilience-and-error-handling)
-23. [Security](#23-security)
-24. [Testing](#24-testing)
-25. [Project layout](#25-project-layout)
-26. [Using this data for research](#26-using-this-data-for-research)
-27. [Attribution and licensing](#27-attribution-and-licensing)
+22. [The cross-platform contract](#22-the-cross-platform-contract)
+23. [Resilience and error handling](#23-resilience-and-error-handling)
+24. [Security](#24-security)
+25. [Testing](#25-testing)
+26. [Project layout](#26-project-layout)
+27. [Using this data for research](#27-using-this-data-for-research)
+28. [Attribution and licensing](#28-attribution-and-licensing)
 
 ---
 ---
@@ -451,7 +452,7 @@ Copy `.env.example` to `.env` and edit. Every setting is optional.
 
 | Variable | Default | Meaning |
 |---|---|---|
-| `OCEAN_HOST` | `127.0.0.1` | **Read [section 23](#23-security) before changing.** |
+| `OCEAN_HOST` | `127.0.0.1` | **Read [section 24](#24-security) before changing.** |
 | `OCEAN_PORT` | `8050` | Port |
 | `OCEAN_DEBUG` | `false` | Dash debug mode |
 | `OCEAN_OPEN_BROWSER` | `true` | Open a browser on start |
@@ -1052,6 +1053,41 @@ zone survives as text or not at all.
 
 ## 21. Design decisions and trade-offs
 
+Every significant choice in this project, what it was chosen over, and why. The
+prose subsections after the table give the reasoning for the ones where the
+alternative looks more attractive than it is.
+
+| Decision | Chosen | Rejected alternative | Why |
+|---|---|---|---|
+| **Database** | SQLite, WAL mode | PostgreSQL / TimescaleDB | The premise is unzip-and-run. Requiring a server contradicts it, and SQLite handles millions of rows fine. WAL is what lets the daemon write while the UI reads. |
+| **Storage API** | Synchronous, thread-safe | `async` all the way down | Dash callbacks are WSGI, i.e. blocking. Reaching an async pool from one means an event loop per request or `run_coroutine_threadsafe` — both deadlock factories. Async stays where it pays: network I/O. |
+| **Event loop** | Exactly one, on a worker thread | `asyncio.run()` per callback | Per-call loops mean a connection pool *and a rate limiter* per call, so N concurrent user actions collectively break a limit each one individually respects. |
+| **Observation identity** | `sha1(lat\|lon\|timestamp)`, source excluded | Include the source in the key | Excluding it makes an Open-Meteo wave reading and a NOAA sea-level reading for the same cell and hour merge into one row, which is what makes correlation possible without a join. |
+| **Merge semantics** | Per-source column ownership | `COALESCE(old, new)` everywhere | Blind coalesce freezes the first forecast value forever and never accepts the correction. Each source declares which columns it owns and which it may only fill. |
+| **Sampling grid** | Equal-area (cos-lat spacing) | Uniform 2°×2° lat/lon | A degree grid puts as many points in the 2° around the pole as at the equator, where cells are sixty times wider. |
+| **Land/sea mask** | Derived from one OISST slice, 8 KB bitmask | Natural Earth shapefile + point-in-polygon | One request, no geometry dependency, no bundled asset. And it is the *same* product family we query, so its idea of land matches. |
+| **Cell validity** | Mask, then probe once and persist | Trust the mask | A cell can be sea by the mask yet outside the wave model's domain. Two of 255 were: the Gulf of Kutch and the Canadian Arctic. |
+| **ERDDAP datasets** | List of variants per kind, fast failover | One hardcoded endpoint | Observed live: a 404 "currently unknown datasetID" while one longitude variant reloaded, with its twin serving fine. |
+| **ERDDAP 404** | Treated as *transient* | 4xx is permanent | For a reloading dataset it is temporary. The identical request succeeded minutes earlier and later. |
+| **Masked-cell search** | One area query, cached to disk | Walk candidate points | 33 sequential round trips cost 2–4 minutes per port and repeated every load. A range subset is one request. |
+| **Rate limiting** | Four layers, per provider | One global token bucket | A bucket cannot see a daily quota, and cannot bound requests in flight. See [section 14](#14-polling-rate-limits-and-being-a-good-citizen). |
+| **Request budget** | Persisted in the database | In-memory counters | Otherwise a restart — or a crash loop — resets a provider's daily quota and lets the app hammer a service it already used up. |
+| **Gazetteer index** | Contentless FTS5 + base table on rowid | FTS5 columns alone | A contentless table returns rowids and nothing else; `UNINDEXED` latitude reads back as NULL. |
+| **Search ranking** | Match tier, then population, then source | BM25 relevance | BM25 normalises by document length, so a famous port with many alternate names ranks *worse* the more famous it is. |
+| **Ports vs cities** | Population first, source only as tiebreak | Ports always win | Source-first makes a small harbour outrank a large city of the same name: `sydn` returned Sydney, Nova Scotia. |
+| **Chart downsampling** | LTTB, server-side, 2,500 points | Send everything; stride sampling | Raw hourly years lock the browser; stride sampling drops the peaks that matter. |
+| **Gap filling** | Per column by extensive/intensive | One global fill switch | Zero is the true value for a count and a false measurement for a temperature. |
+| **Correlation input** | Daily means | Raw timestamps | The sources do not share a clock — hourly, 12:00 UTC, 00:00 UTC — so no row ever carried two variables and every pairwise overlap was empty. |
+| **Coordinate fallback** | Explicit `is None` | `marine_lat or lat` | 0.0 is a real coordinate. The Greenwich meridian and the equator are places. |
+| **File swaps** | `atomic_replace` helper | `Path.replace` | POSIX replaces an open file; Windows refuses. See [section 22](#22-the-cross-platform-contract). |
+| **Two map layers** | Points and currents as separate traces | One combined trace | Per-segment colour is impossible in one line trace, so speed bands need their own traces to get a legend. |
+| **Expandable rows** | `<details>` / `<summary>` | Pattern-matching callbacks + a store | Native disclosure needs no callback and no state to keep in sync. |
+| **Place autocomplete** | Text input + explicit result list | `dcc.Dropdown` | Dropdown re-filters server results on the client by substring, so diacritics make a correct hit disappear. |
+| **Selection echo** | Leave the typed text alone | Write the label into the input | Writing it back re-triggers the suggest callback and reopens the list the click just closed. |
+| **Shutdown** | Handler raises `SystemExit` | Clean up and return | The web server blocks the main thread; cleanup alone leaves the process serving after its daemon is dead. |
+| **Timestamps** | Integer epoch ms, UTC | ISO text | Integer comparison is index-friendly and sidesteps collation and timezone bugs. |
+| **Export format** | Zip bundle with manifest + dictionary | Bare CSV | Units, provenance and caveats have to travel with the rows or the data is unusable later. |
+
 ### One event loop, shared
 
 Dash callbacks are synchronous WSGI functions; every network client here is
@@ -1099,7 +1135,42 @@ unwind the blocking call. Measured: clean exit in about one second.
 
 ---
 
-## 22. Resilience and error handling
+---
+
+## 22. The cross-platform contract
+
+macOS, Linux and Windows are supported by the same Python and the same
+launcher logic. The places where the platforms genuinely differ are handled
+explicitly rather than hoped over.
+
+| Concern | How it is handled |
+|---|---|
+| **Entry point** | `run.sh` (macOS/Linux) and `run.bat` (Windows) take **identical arguments** and both forward everything to `run.py`. There is no platform-specific code path in the application itself. |
+| **Executable bit** | `run.sh` and the service scripts are committed mode `100755`, so a fresh `git clone` runs them without `chmod`. A test asserts this. |
+| **Paths with spaces** | Both launchers quote (`cd "$(dirname "$0")"`, `cd /d "%~dp0"`). This project already lives under a path containing a space. |
+| **Python discovery** | `run.sh` tries `python3.13…3.10`, `python3`, `python`; `run.bat` tries `py`, `python`, `python3`. Both verify `>= 3.10` before using one, and both explain how to install it if none qualifies. |
+| **Dependency staleness** | Both gate reinstall on a **SHA-256 of `requirements.txt`** (`shasum`/`sha256sum` and `certutil`). Not mtime: a `git checkout` rewrites mtimes even when content is identical. Previously Windows never reinstalled at all, so it silently ran stale packages after a pull. |
+| **Console encoding** | `run.bat` sets `chcp 65001`, and the logger reconfigures stdout with `errors="replace"`. Without both, a non-ASCII path or place name raises `UnicodeEncodeError` from inside a log handler and kills the process on a default cp1252 console. |
+| **Atomic file replacement** | POSIX replaces a file another process holds open; Windows raises `PermissionError`. `fileops.atomic_replace` falls back to moving the old file aside and, failing that, preserves the newly built file with an actionable message. This is what makes "rebuild the gazetteer while the app is running" work on Windows. |
+| **Signals** | `SIGINT` and `SIGTERM` everywhere, plus `SIGBREAK` on Windows — which is what closing a console actually sends. Unsupported signals are skipped rather than crashing. |
+| **Background service** | launchd user agent (macOS), systemd user unit (Linux), NSSM service (Windows). All three are user-level except the Windows service, which needs elevation to install. |
+| **SQLite** | WAL mode works on all three. The write-ahead log is checkpointed on shutdown so the database is portable between machines. |
+
+**Fresh-device rehearsal.** Verified by cloning the repository into an empty
+directory and running `./run.sh` with no pre-existing `.venv`, `data/`, `logs/`
+or `.env`: virtual environment created, dependencies installed, ocean mask
+derived, grid built, **24,288 observations in the first cycle**, and a
+20,403-entry port database built — no manual steps, no `chmod`, and an empty
+`errors.log`. Re-running did not reinstall dependencies, confirming the hash
+stamp. Starting a second instance on the same port produced the actionable
+port-in-use message rather than a traceback.
+
+The Windows path shares all of this logic and its platform-specific branches are
+covered by tests, but it has not been executed on a Windows machine.
+
+---
+
+## 23. Resilience and error handling
 
 | Failure mode | Response |
 |---|---|
@@ -1122,7 +1193,7 @@ failures are trivially greppable. Both rotate.
 
 ---
 
-## 23. Security
+## 24. Security
 
 **There is no authentication on the web interface.** It binds to `127.0.0.1` by
 default, so only your own machine can reach it.
@@ -1144,9 +1215,9 @@ Other properties worth noting:
 
 ---
 
-## 24. Testing
+## 25. Testing
 
-**126 tests, all offline.** They need no network and never touch your real data
+**146 tests, all offline.** They need no network and never touch your real data
 directory — every test runs against a temporary database.
 
 ```bash
@@ -1162,6 +1233,8 @@ directory — every test runs against a temporary database.
 | `test_export.py` | 20 | Gap-fill semantics, schema stability, Parquet round-trip, CSV timezone text, bundle contents, data-dictionary coverage, measured-vs-modelled provenance, opt-in derived features |
 | `test_math_engine.py` | 14 | Wave power, circular means, LTTB shape preservation, rolling z-scores, resampling |
 | `test_models.py` | 9 | All-null rejection, longitude wrapping, NaN handling, identity |
+| `test_platform.py` | 16 | Zero-coordinate handling, replace-while-open, launcher parity, committed exec bits, port and corrupt-database guards |
+| `test_logging_filter.py` | 4 | Stale-callback suppression without swallowing real errors |
 
 The tests encode the traps, not just the happy paths: that a land response is
 HTTP 200 with nulls, that a 404 can be transient, that a contentless FTS5 table
@@ -1170,7 +1243,7 @@ cache hit requires containment rather than proximity.
 
 ---
 
-## 25. Project layout
+## 26. Project layout
 
 ```
 run.py                        entry point: web, daemon, or gazetteer
@@ -1181,6 +1254,7 @@ requirements.txt              core dependencies
 src/oceanpulse/
   config.py                   settings, endpoints, measured archive floors
   logging_setup.py            dual rotating logs
+  fileops.py                  cross-platform atomic file replacement
   models.py                   Pydantic validation boundary
   math_engine.py              wave power, anomalies, LTTB, resampling
   storage/
@@ -1209,14 +1283,14 @@ src/oceanpulse/
     tab_pulse.py, tab_timeline.py, tab_analytics.py, tab_export.py, tab_learn.py
 
 scripts/                      gazetteer builder, service install/uninstall
-tests/                        126 offline tests
+tests/                        146 offline tests
 ```
 
 About 12,000 lines of Python.
 
 ---
 
-## 26. Using this data for research
+## 27. Using this data for research
 
 ### Where the data lives
 
@@ -1266,7 +1340,7 @@ makes a dataset trustworthy to a reader.
 
 ---
 
-## 27. Attribution and licensing
+## 28. Attribution and licensing
 
 **Wave, current and near-term sea-surface temperature data** —
 [Open-Meteo](https://open-meteo.com/), licensed
