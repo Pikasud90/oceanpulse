@@ -47,6 +47,15 @@ def setup_logging(log_dir: Path, level: int = logging.INFO, console: bool = True
     root.addHandler(error_handler)
 
     if console:
+        # A Windows console defaults to a legacy code page, so logging a place
+        # name or a project path containing a non-ASCII character raises
+        # UnicodeEncodeError from inside the handler. Replacing unencodable
+        # characters is strictly better than losing the process.
+        if hasattr(sys.stdout, "reconfigure"):
+            try:
+                sys.stdout.reconfigure(errors="replace")
+            except (ValueError, OSError):
+                pass
         stream = logging.StreamHandler(sys.stdout)
         stream.setLevel(level)
         stream.setFormatter(formatter)

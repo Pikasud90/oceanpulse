@@ -21,7 +21,7 @@ from __future__ import annotations
 
 import hashlib
 import math
-from typing import Any
+from typing import Any, Mapping
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
@@ -69,6 +69,25 @@ FILL_ONLY_FIELDS = {
 def wrap_longitude(lon: float) -> float:
     """Normalise any longitude onto [-180, 180)."""
     return ((float(lon) + 180.0) % 360.0) - 180.0
+
+
+def marine_coordinates(port: Mapping[str, Any]) -> tuple[float, float]:
+    """The cell to read marine data from for a port, falling back to the harbour.
+
+    Written as an explicit `is None` test rather than `marine_latitude or
+    latitude`, because **0.0 is a perfectly good coordinate**. The equator and
+    the Greenwich meridian are real places: Tema in Ghana sits within a
+    hundredth of a degree of 0° longitude, and a resolved marine cell there is
+    genuinely 0.0. Under `or`, that value is falsy, so the code silently
+    discarded the resolved offshore cell and read the harbour instead — the
+    exact failure the resolution step exists to prevent, and invisible in the
+    output because the reverted coordinate is still plausible.
+    """
+    marine_lat = port.get("marine_latitude")
+    marine_lon = port.get("marine_longitude")
+    latitude = float(marine_lat if marine_lat is not None else port["latitude"])
+    longitude = float(marine_lon if marine_lon is not None else port["longitude"])
+    return latitude, longitude
 
 
 def observation_id(latitude: float, longitude: float, timestamp_ms: int) -> str:

@@ -6,6 +6,11 @@ REM All arguments are passed straight through to run.py.
 SETLOCAL EnableDelayedExpansion
 cd /d "%~dp0"
 
+REM UTF-8 console. Without this, a place name or a project path containing a
+REM non-ASCII character can raise UnicodeEncodeError inside logging on a
+REM default cp1252 console and take the process down.
+chcp 65001 >nul 2>&1
+
 set "PYTHON="
 for %%P in (py python python3) do (
     if not defined PYTHON (
@@ -36,7 +41,19 @@ if not exist ".venv" (
 
 call .venv\Scripts\activate.bat
 
-if not exist ".venv\.requirements-stamp" (
+REM Reinstall only when requirements.txt has actually changed, compared by
+REM content hash so a git checkout does not trigger a pointless reinstall.
+REM run.sh uses the identical rule, so both platforms behave the same.
+set "STAMP=.venv\.requirements-stamp"
+set "WANT="
+for /f "skip=1 tokens=* delims=" %%H in ('certutil -hashfile requirements.txt SHA256 2^>nul') do (
+    if not defined WANT set "WANT=%%H"
+)
+set "WANT=%WANT: =%"
+set "HAVE="
+if exist "%STAMP%" set /p HAVE=<"%STAMP%"
+
+if not "%WANT%"=="%HAVE%" (
     echo Installing dependencies ^(this takes about a minute the first time^)...
     python -m pip install --quiet --upgrade pip
     python -m pip install --quiet -r requirements.txt
@@ -45,7 +62,7 @@ if not exist ".venv\.requirements-stamp" (
         pause
         exit /b 1
     )
-    echo. > .venv\.requirements-stamp
+    >"%STAMP%" echo|set /p="%WANT%"
 )
 
 python run.py %*

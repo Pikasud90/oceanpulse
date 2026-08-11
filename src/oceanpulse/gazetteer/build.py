@@ -37,6 +37,7 @@ from pathlib import Path
 from typing import Any, Iterable, Sequence
 
 from ..config import GEONAMES_BASE_URL, WPI_URL
+from ..fileops import atomic_replace, remove_quietly
 from ..logging_setup import get_logger
 from ..math_engine import haversine_km
 from ..models import PortRecord
@@ -358,10 +359,10 @@ def write_gazetteer(
         connection.close()
 
     for suffix in ("-wal", "-shm"):
-        stray = Path(str(temporary) + suffix)
-        if stray.exists():
-            stray.unlink()
-    temporary.replace(path)
+        remove_quietly(Path(str(temporary) + suffix))
+    # Windows will not replace ports.sqlite while the interface holds it open,
+    # so this goes through the helper, which moves the old file aside instead.
+    atomic_replace(temporary, path)
     log.info("Gazetteer written to %s (%d entries)", path, count)
     return count
 

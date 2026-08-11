@@ -25,6 +25,7 @@ from typing import Any
 
 from ..config import ALLOWED_POLL_INTERVALS, Config
 from ..logging_setup import get_logger
+from ..models import marine_coordinates
 from ..storage.sqlite_backend import SQLiteStorage
 from .grid import OceanMask, build_macro_grid, default_mask_date
 from .http import PermanentError, RateLimitedClient, TransientError
@@ -145,13 +146,7 @@ class IngestionDaemon:
         if not ports:
             return {"ports": 0, "observations": 0}
 
-        coordinates = [
-            (
-                float(p["marine_latitude"] or p["latitude"]),
-                float(p["marine_longitude"] or p["longitude"]),
-            )
-            for p in ports
-        ]
+        coordinates = [marine_coordinates(p) for p in ports]
         port_ids = [str(p["port_id"]) for p in ports]
 
         observations, with_data, _ = await self.marine.fetch_points(

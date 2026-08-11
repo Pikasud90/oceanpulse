@@ -19,7 +19,7 @@ from typing import Any
 
 from ..config import Config
 from ..logging_setup import get_logger
-from ..models import MarineObservation
+from ..models import MarineObservation, marine_coordinates
 from ..storage.base import BoundingBox
 from ..storage.sqlite_backend import SQLiteStorage
 from .cache_ledger import date_to_ms, point_bbox
@@ -46,8 +46,7 @@ async def backfill_port(
     Returns a per-source report so the interface can say what it actually did
     rather than showing a spinner and a blank chart.
     """
-    latitude = float(port.get("marine_latitude") or port["latitude"])
-    longitude = float(port.get("marine_longitude") or port["longitude"])
+    latitude, longitude = marine_coordinates(port)
     port_id = str(port["port_id"])
     bbox = point_bbox(latitude, longitude)
     start_ms, end_ms = date_to_ms(start), date_to_ms(end, end_of_day=True)

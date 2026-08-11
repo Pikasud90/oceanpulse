@@ -65,6 +65,79 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     return parser.parse_args(argv)
 
 
+def port_is_free(host: str, port: int) -> bool:
+    """Check the port before Dash tries to bind it.
+
+    Without this, a port clash surfaces as a Werkzeug traceback ending in
+    "Address already in use" — which does not tell a non-developer what to do,
+    and is easy to hit when a previous run is still alive or another app owns
+    8050.
+    """
+    import socket
+
+    probe = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    try:
+        # No SO_REUSEADDR: we want to know whether a real listener is there,
+        # not whether we could squeeze in beside one.
+        probe.bind(("" if host == "0.0.0.0" else host, port))
+        return True
+    except OSError:
+        return False
+    finally:
+        probe.close()
+
+
+def open_storage_or_explain(db_path: Path):
+    """Open the database, turning corruption into instructions.
+
+    A truncated or non-SQLite file raises `sqlite3.DatabaseError: file is not a
+    database`, which as a bare traceback looks like a bug in the application
+    rather than a damaged file the user can simply move aside.
+    """
+    import sqlite3
+
+    from oceanpulse.storage.sqlite_backend import SQLiteStorage
+
+    storage = SQLiteStorage(db_path)
+    try:
+        storage.initialise()
+    except sqlite3.DatabaseError as exc:
+        print(
+            f"\n  ERROR: {db_path} could not be opened ({exc}).\n"
+            f"\n  The file looks damaged or is not a SQLite database. Every"
+            f"\n  observation in it can be re-collected from the public sources,"
+            f"\n  so the fix is simply to move it aside:\n"
+            f"\n      mv \"{db_path}\" \"{db_path}.broken\"\n"
+            f"\n  Then start OceanPulse again. Your port database and ocean mask"
+            f"\n  are separate files and are not affected.\n",
+            file=sys.stderr,
+        )
+        raise SystemExit(1) from exc
+    return storage
+
+
+def check_sqlite_features() -> None:
+    """Warn early if this Python's SQLite lacks FTS5.
+
+    Place search is the only feature that needs it, and it fails at *build*
+    time with an opaque OperationalError. Saying so at startup is kinder than
+    letting a 90-second download end in a stack trace.
+    """
+    import sqlite3
+
+    connection = sqlite3.connect(":memory:")
+    try:
+        connection.execute("CREATE VIRTUAL TABLE _probe USING fts5(a)")
+    except sqlite3.OperationalError:
+        log.warning(
+            "This Python's SQLite was built without FTS5, so the offline port "
+            "search cannot be built. Everything else works. Installing Python "
+            "from python.org (rather than a minimal system build) resolves it."
+        )
+    finally:
+        connection.close()
+
+
 def install_signal_handlers(on_stop) -> None:
     def handler(signum, _frame):  # noqa: ANN001
         log.info("received signal %s, shutting down", signum)
@@ -199,10 +272,9 @@ def main(argv: list[str] | None = None) -> int:
         return command_gazetteer(config, args.force)
 
     from oceanpulse.ingest import runner
-    from oceanpulse.storage.sqlite_backend import SQLiteStorage
 
-    storage = SQLiteStorage(config.db_path)
-    storage.initialise()
+    check_sqlite_features()
+    storage = open_storage_or_explain(config.db_path)
     if args.poll_interval:
         storage.set_setting("poll_interval_minutes", str(args.poll_interval))
 
@@ -234,6 +306,22 @@ def main(argv: list[str] | None = None) -> int:
         finally:
             stop_everything()
         return 0
+
+    if not port_is_free(config.host, config.port):
+        print(
+            f"\n  ERROR: port {config.port} on {config.host} is already in use.\n"
+            f"\n  Something is listening there already — most often a previous"
+            f"\n  OceanPulse that is still running, or another app that claimed"
+            f"\n  the port. Either stop it, or pick a different port:\n"
+            f"\n      ./run.sh --port 9000        (macOS / Linux)"
+            f"\n      run.bat --port 9000         (Windows)\n"
+            f"\n  To find the process holding it:\n"
+            f"\n      lsof -iTCP:{config.port} -sTCP:LISTEN   (macOS / Linux)"
+            f"\n      netstat -ano | findstr :{config.port}    (Windows)\n",
+            file=sys.stderr,
+        )
+        stop_everything()
+        return 1
 
     from oceanpulse.ui.app import build_app
 

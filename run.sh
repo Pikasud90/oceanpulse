@@ -36,13 +36,25 @@ fi
 # shellcheck disable=SC1091
 source .venv/bin/activate
 
-# Reinstall only when the requirements file is newer than the last install.
+# Reinstall only when requirements.txt has actually changed. Compared by
+# content hash, not modification time: a fresh `git clone` or `git checkout`
+# rewrites mtimes even when the file is byte-identical, which would reinstall
+# on every pull for no reason.
 STAMP=".venv/.requirements-stamp"
-if [ ! -f "$STAMP" ] || [ requirements.txt -nt "$STAMP" ]; then
+if command -v shasum >/dev/null 2>&1; then
+    WANT="$(shasum -a 256 requirements.txt | cut -d' ' -f1)"
+elif command -v sha256sum >/dev/null 2>&1; then
+    WANT="$(sha256sum requirements.txt | cut -d' ' -f1)"
+else
+    WANT="no-hash-tool"
+fi
+HAVE="$(cat "$STAMP" 2>/dev/null || true)"
+
+if [ "$WANT" != "$HAVE" ]; then
     echo "Installing dependencies (this takes about a minute the first time)..."
     python -m pip install --quiet --upgrade pip
     python -m pip install --quiet -r requirements.txt
-    touch "$STAMP"
+    printf '%s' "$WANT" > "$STAMP"
 fi
 
 exec python run.py "$@"

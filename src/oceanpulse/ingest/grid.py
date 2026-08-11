@@ -22,6 +22,7 @@ import math
 from pathlib import Path
 from typing import Iterable, Sequence
 
+from ..fileops import atomic_replace
 from ..logging_setup import get_logger
 
 log = get_logger(__name__)
@@ -115,7 +116,9 @@ class OceanMask:
         temporary = path.with_suffix(path.suffix + ".tmp")
         temporary.write_bytes(MASK_MAGIC + bytes(self.bits))
         # Swap into place so an interrupted write never leaves a half mask.
-        temporary.replace(path)
+        # Windows refuses to replace a file another process holds open, so this
+        # goes through the helper rather than Path.replace directly.
+        atomic_replace(temporary, path)
         log.info(
             "Ocean mask saved to %s (%d ocean cells of %d)",
             path,
