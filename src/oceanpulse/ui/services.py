@@ -29,6 +29,7 @@ class Services:
         self.storage.initialise()
         self.gazetteer = GazetteerStore(config.ports_db_path)
         self._lock = threading.Lock()
+        self._erddap = None
 
     # -- async bridge -----------------------------------------------------
 
@@ -38,7 +39,26 @@ class Services:
 
     @property
     def client(self):  # noqa: ANN201 - RateLimitedClient, avoids a cycle
-        return runner.get_client(self.config)
+        return runner.get_client(self.config, self.storage)
+
+    @property
+    def erddap(self):  # noqa: ANN201 - ErddapClient, avoids a cycle
+        """One ERDDAP client for the whole process.
+
+        Its caches - resolved cells and dataset coverage - are what keep a
+        timeline load from re-probing a masked coastline every single time, so
+        it has to outlive the request that created it.
+        """
+        with self._lock:
+            if self._erddap is None:
+                from ..ingest.noaa_erddap import ErddapClient
+
+                self._erddap = ErddapClient(self.client, store=self.storage)
+            return self._erddap
+
+    def request_budget(self) -> list[dict[str, object]]:
+        """Per-provider request usage, for the status bar."""
+        return self.client.budget_snapshot()
 
     # -- settings ---------------------------------------------------------
 

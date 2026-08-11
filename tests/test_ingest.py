@@ -15,7 +15,15 @@ from oceanpulse.ingest.cache_ledger import (
     is_covered,
 )
 from oceanpulse.ingest.grid import OceanMask, build_macro_grid, equal_area_points
-from oceanpulse.ingest.http import TokenBucket
+from oceanpulse.ingest.limits import (
+    ERDDAP,
+    OPEN_METEO,
+    BudgetExceeded,
+    GateRegistry,
+    RequestBudget,
+    TokenBucket,
+    limits_for,
+)
 from oceanpulse.ingest.noaa_erddap import (
     _parse_griddap_csv,
     _parse_time_actual_range,
@@ -54,6 +62,65 @@ def test_token_bucket_limits_sustained_rate():
     elapsed = asyncio.run(drain())
     # Two are free from the burst; the remaining six take ~0.6s at 10/s.
     assert elapsed >= 0.5
+
+
+def test_providers_get_separate_buckets():
+    """One shared bucket makes a slow research server throttle a fast CDN.
+
+    ERDDAP takes seconds per query and must be gentler than Open-Meteo; sharing
+    one limiter means choosing between being needlessly slow with one or
+    needlessly harsh on the other.
+    """
+    registry = GateRegistry()
+    marine = registry.gate_for("https://marine-api.open-meteo.com/v1/marine")
+    erddap = registry.gate_for("https://coastwatch.pfeg.noaa.gov/erddap/griddap/x.csv")
+    assert marine is not erddap
+    assert marine.bucket is not erddap.bucket
+    assert erddap.limits.rate_per_second < marine.limits.rate_per_second
+    assert erddap.limits.max_concurrent == 1
+
+    # Same provider, different host in the same family -> same gate object.
+    again = registry.gate_for("https://marine-api.open-meteo.com/v1/marine?x=1")
+    assert again is marine
+
+
+def test_unknown_host_gets_the_cautious_limits():
+    """An unrecognised endpoint must not default to the most permissive rate."""
+    assert limits_for("https://example.invalid/data.csv") is ERDDAP
+
+
+def test_budget_blocks_when_daily_quota_is_spent():
+    """A rate limit cannot see a daily quota; only counting can."""
+    budget = RequestBudget()
+    budget.record(OPEN_METEO, count=OPEN_METEO.daily_budget)
+    with pytest.raises(BudgetExceeded):
+        budget.check(OPEN_METEO)
+    # A different provider is unaffected.
+    budget.check(ERDDAP)
+
+
+def test_budget_survives_a_restart():
+    """Restarting must not reset a provider's quota.
+
+    Otherwise a crash loop becomes an unintentional way to hammer a free
+    service that has already been used up for the day.
+    """
+    store: dict[str, str] = {}
+    first = RequestBudget(load=store.get, save=lambda k, v: store.__setitem__(k, v))
+    first.record(OPEN_METEO, count=25)
+
+    second = RequestBudget(load=store.get, save=lambda k, v: store.__setitem__(k, v))
+    used = {row["provider"]: row["day_used"] for row in second.snapshot()}
+    assert used["open-meteo"] == 25
+
+
+def test_budget_snapshot_reports_every_provider():
+    rows = RequestBudget().snapshot()
+    names = {row["provider"] for row in rows}
+    assert {"open-meteo", "erddap", "bulk-download"} <= names
+    for row in rows:
+        assert row["day_budget"] > 0
+        assert row["published_note"]
 
 
 def test_token_bucket_allows_the_burst_immediately():
@@ -192,47 +259,99 @@ def test_erddap_sla_has_no_zlev_dimension():
     assert observations[0].port_id == "wpi:1"
 
 
-def test_resolve_cell_searches_outwards_when_masked():
+class _FakeHttp:
+    """Records URLs and returns canned griddap CSV."""
+
+    def __init__(self, body: str) -> None:
+        self.body = body
+        self.urls: list[str] = []
+
+    async def get_text(self, url, params=None, conditional=False, max_attempts=None):
+        self.urls.append(url)
+        return self.body
+
+
+def _area_csv(rows: list[tuple[float, float, str]]) -> str:
+    """Build an OISST-shaped area response: header, units, then data."""
+    lines = [
+        "time,zlev,latitude,longitude,sst",
+        "UTC,m,degrees_north,degrees_east,degree_C",
+    ]
+    for lat, lon, value in rows:
+        lines.append(f"2026-02-20T12:00:00Z,0.0,{lat},{lon},{value}")
+    return "\n".join(lines) + "\n"
+
+
+def test_resolve_cell_uses_one_area_request_and_picks_the_nearest():
     """One product's water is another's land.
 
     Open-Meteo resolves a spot just off Rotterdam on its own wave grid; OISST
     has that same 0.25 degree cell masked and returns NaN for every day. Without
-    an outward search, sea temperature is permanently empty for exactly the
-    coastal ports this application exists to examine.
+    a search, sea temperature is permanently empty for exactly the coastal ports
+    this application exists to examine.
+
+    The search must cost ONE request. Probing candidates one at a time took two
+    to four minutes per port against a server that answers in seconds.
     """
     from oceanpulse.ingest.noaa_erddap import ErddapClient
 
-    client = ErddapClient(client=None)  # no HTTP: _fetch_chunk is replaced
-    working = (51.9, 3.98)
-    calls: list[tuple[float, float]] = []
+    body = _area_csv(
+        [
+            (51.875, 4.375, "NaN"),   # requested cell: masked
+            (51.875, 4.125, "NaN"),
+            (51.875, 3.875, "7.31"),  # nearest cell with data
+            (51.375, 3.875, "7.10"),  # further away, also valid
+        ]
+    )
+    http = _FakeHttp(body)
+    client = ErddapClient(client=http)
 
-    async def fake_chunk(kind, lat, lon, start, end):
-        calls.append((round(lat, 2), round(lon, 2)))
-        if (round(lat, 2), round(lon, 2)) == working:
-            return _parse_griddap_csv(ERDDAP_SST_CSV)
-        return []
-
-    client._fetch_chunk = fake_chunk  # type: ignore[assignment]
     found = asyncio.run(client.resolve_cell("sst", 51.9, 4.23, dt.date(2026, 3, 1)))
 
-    assert found == working
-    assert calls[0] == (51.9, 4.23)  # the requested point is tried first
+    assert found == (51.875, 3.875)
+    assert len(http.urls) == 1, "cell resolution must be a single area query"
+    # The query must subset a *range*, not a point.
+    assert "):1:(" in http.urls[0]
+
     # And the answer is cached rather than re-probed.
-    before = len(calls)
     asyncio.run(client.resolve_cell("sst", 51.9, 4.23, dt.date(2026, 3, 1)))
-    assert len(calls) == before
+    assert len(http.urls) == 1
 
 
 def test_resolve_cell_gives_up_rather_than_wandering():
     from oceanpulse.ingest.noaa_erddap import ErddapClient
 
-    client = ErddapClient(client=None)
-
-    async def always_empty(kind, lat, lon, start, end):
-        return []
-
-    client._fetch_chunk = always_empty  # type: ignore[assignment]
+    http = _FakeHttp(_area_csv([(0.125, 0.125, "NaN"), (0.375, 0.375, "NaN")]))
+    client = ErddapClient(client=http)
     assert asyncio.run(client.resolve_cell("sst", 0.0, 0.0, dt.date(2026, 3, 1))) is None
+
+
+def test_resolved_cell_persists_across_client_instances():
+    """A masked coastline does not move; this should be paid once, ever."""
+    from oceanpulse.ingest.noaa_erddap import ErddapClient
+
+    store: dict[str, str] = {}
+
+    class _Store:
+        def get_setting(self, key, default=None):
+            return store.get(key, default)
+
+        def set_setting(self, key, value):
+            store[key] = value
+
+    body = _area_csv([(51.875, 4.375, "NaN"), (51.875, 3.875, "7.31")])
+    first_http = _FakeHttp(body)
+    first = ErddapClient(client=first_http, store=_Store())
+    assert asyncio.run(first.resolve_cell("sst", 51.9, 4.23, dt.date(2026, 3, 1)))
+    assert len(first_http.urls) == 1
+
+    # A fresh client - as a new process would build - makes no request at all.
+    second_http = _FakeHttp(body)
+    second = ErddapClient(client=second_http, store=_Store())
+    assert asyncio.run(
+        second.resolve_cell("sst", 51.9, 4.23, dt.date(2026, 3, 1))
+    ) == (51.875, 3.875)
+    assert second_http.urls == []
 
 
 def test_time_actual_range_parsing():

@@ -2,17 +2,79 @@
 
 from __future__ import annotations
 
+import logging
+import time
 from typing import Any
 
 import dash
-from dash import Input, Output, State, dcc, html
+from dash import Input, Output, State, dcc, html, no_update
 
 from ..config import ALLOWED_POLL_INTERVALS, Config
 from ..logging_setup import get_logger
-from . import tab_analytics, tab_export, tab_pulse, tab_timeline, theme
+from . import tab_analytics, tab_export, tab_learn, tab_pulse, tab_timeline, theme
 from .services import Services, init_services
 
 log = get_logger(__name__)
+
+_UNKNOWN_CALLBACK_MARKER = "Callback function not found for output"
+
+
+class _UnknownCallbackFilter(logging.Filter):
+    """Collapse "callback not found" tracebacks into one throttled warning.
+
+    A browser tab left open on a *different* Dash app that used to own this
+    port keeps polling `/_dash-update-component` with that app's callback
+    signature. Dash correctly raises KeyError, and Flask logs a full traceback
+    for each one - roughly every two minutes, forever. That buries real errors
+    in `errors.log` and is entirely outside this application's control: any
+    stale or malicious client can trigger it.
+
+    The condition is worth knowing about once, not five hundred times, so it is
+    reported as a single periodic warning naming the likely cause.
+    """
+
+    def __init__(self, interval_seconds: float = 600.0) -> None:
+        super().__init__()
+        self.interval = interval_seconds
+        self._suppressed = 0
+        self._last_reported = 0.0
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        text = record.getMessage()
+        if record.exc_info and record.exc_info[1] is not None:
+            text += " " + str(record.exc_info[1])
+        if _UNKNOWN_CALLBACK_MARKER not in text:
+            return True
+
+        self._suppressed += 1
+        now = time.monotonic()
+        if now - self._last_reported >= self.interval:
+            self._last_reported = now
+            log.warning(
+                "Ignored %d request(s) for callbacks this app does not define. "
+                "This is almost always a browser tab left open on a different "
+                "Dash app that previously used this port - hard-refresh or close "
+                "it. Nothing in OceanPulse is broken by these.",
+                self._suppressed,
+            )
+            self._suppressed = 0
+        return False
+
+def install_unknown_callback_filter(app: dash.Dash) -> _UnknownCallbackFilter:
+    """Attach the filter where every record has to pass: the handlers.
+
+    Attaching only to the logger is not reliable enough. Flask's error logging
+    reaches the root handlers through paths that a logger-level filter can miss,
+    and the observed result was four tracebacks surviving out of five. A filter
+    on each handler is applied to every record that handler is asked to emit,
+    whichever logger produced it, so nothing slips past.
+    """
+    stale = _UnknownCallbackFilter()
+    app.server.logger.addFilter(stale)
+    for handler in logging.getLogger().handlers:
+        handler.addFilter(stale)
+    return stale
+
 
 INDEX_TEMPLATE = """<!DOCTYPE html>
 <html>
@@ -43,6 +105,8 @@ def build_app(config: Config | None = None) -> tuple[dash.Dash, Services]:
         index_string=INDEX_TEMPLATE.replace("__STYLESHEET__", theme.STYLESHEET),
     )
 
+    install_unknown_callback_filter(app)
+
     app.layout = html.Div(
         [
             dcc.Interval(id="header-refresh", interval=15_000, n_intervals=0),
@@ -63,6 +127,8 @@ def build_app(config: Config | None = None) -> tuple[dash.Dash, Services]:
                                     className="op-tab", selected_className="op-tab--selected"),
                             dcc.Tab(label="Data Export", value="export",
                                     className="op-tab", selected_className="op-tab--selected"),
+                            dcc.Tab(label="Encyclopedia", value="learn",
+                                    className="op-tab", selected_className="op-tab--selected"),
                         ],
                     ),
                     html.Div(id="op-tab-content", style={"marginTop": "18px"}),
@@ -78,18 +144,25 @@ def build_app(config: Config | None = None) -> tuple[dash.Dash, Services]:
     tab_timeline.register(app, services)
     tab_analytics.register(app, services)
     tab_export.register(app, services)
+    tab_learn.register(app, services)
     return app, services
 
 
 def _header(services: Services) -> html.Div:
     return html.Div(
         [
-            html.Div(
+            # A button, not a div: the wordmark is the way home from anywhere,
+            # so it has to be reachable by keyboard and announce itself as a
+            # control.
+            html.Button(
                 [
                     html.H1("OceanPulse"),
                     html.Span("self-hosted marine data engine"),
                 ],
+                id="brand-home",
                 className="op-brand",
+                n_clicks=0,
+                title="Back to Global Pulse",
             ),
             html.Div(
                 [
@@ -159,7 +232,19 @@ def _register_shell(app: dash.Dash, services: Services) -> None:
             return tab_analytics.layout(services)
         if tab == "export":
             return tab_export.layout(services)
+        if tab == "learn":
+            return tab_learn.layout(services)
         return tab_pulse.layout(services)
+
+    @app.callback(
+        Output("op-tabs", "value"),
+        Input("brand-home", "n_clicks"),
+        prevent_initial_call=True,
+    )
+    def _home(clicks: int | None):
+        if not clicks:
+            return no_update
+        return "pulse"
 
     @app.callback(
         Output("header-status", "children"),
@@ -168,18 +253,76 @@ def _register_shell(app: dash.Dash, services: Services) -> None:
     def _status(_ticks: int):
         summary = services.status_summary()
         status = summary.get("daemon_status", "stopped")
-        return [
-            html.Div([html.B(theme.format_count(summary["total_observations"])), " observations"]),
-            html.Div([html.B(theme.format_count(summary["valid_grid_points"])), " grid cells"]),
-            html.Div([html.B(theme.format_count(summary["tracked_ports"])), " tracked ports"]),
-            html.Div([html.B(theme.format_bytes(summary["database_bytes"])), " on disk"]),
-            html.Div(
-                theme.STATUS_LABELS.get(status, status),
-                title=summary.get("daemon_detail", ""),
-                style={"color": theme.STATUS_COLOURS.get(status, theme.TEXT_MUTED),
-                       "fontWeight": 600},
-            ),
+
+        def item(label: str, value: str, **kwargs: Any) -> html.Div:
+            return html.Div(
+                [
+                    html.Div(label, className="op-status-label"),
+                    html.Div(html.B(value), **kwargs),
+                ],
+                className="op-status-item",
+            )
+
+        cells: list[Any] = [
+            item("Observations", theme.format_count(summary["total_observations"])),
+            item("Grid cells", theme.format_count(summary["valid_grid_points"])),
+            item("Tracked ports", theme.format_count(summary["tracked_ports"])),
+            item("On disk", theme.format_bytes(summary["database_bytes"])),
         ]
+
+        # Request budget: the operator should be able to see how much of each
+        # provider's goodwill has been spent today without reading a log.
+        try:
+            budget = services.request_budget()
+        except Exception:  # noqa: BLE001 - a status bar must never break a page
+            budget = []
+        for row in budget:
+            used = int(row["day_used"])
+            limit = max(1, int(row["day_budget"]))
+            if used == 0:
+                continue
+            pct = min(100.0, 100.0 * used / limit)
+            colour = (
+                theme.DANGER if pct > 90 else theme.WARNING if pct > 60 else theme.ACCENT
+            )
+            cells.append(
+                html.Div(
+                    [
+                        html.Div(f"{row['provider']} today", className="op-status-label"),
+                        html.Div(html.B(f"{used:,} / {limit:,}")),
+                        html.Div(
+                            html.Div(
+                                className="op-budget-fill",
+                                style={"width": f"{pct:.0f}%", "background": colour},
+                            ),
+                            className="op-budget-bar",
+                        ),
+                    ],
+                    className="op-status-item",
+                    title=(
+                        f"Self-imposed cap, well inside the provider's limit "
+                        f"({row['published_note']}). Resets at 00:00 UTC."
+                    ),
+                )
+            )
+
+        cells.append(
+            html.Div(
+                [
+                    html.Div("Daemon", className="op-status-label"),
+                    html.Div(
+                        theme.STATUS_LABELS.get(status, status),
+                        style={
+                            "color": theme.STATUS_COLOURS.get(status, theme.TEXT_MUTED),
+                            "fontWeight": 650,
+                        },
+                    ),
+                ],
+                className="op-status-item",
+                title=summary.get("daemon_detail", ""),
+            )
+        )
+        return cells
 
     @app.callback(
         Output("header-poll-interval", "value"),

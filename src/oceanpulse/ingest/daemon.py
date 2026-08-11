@@ -44,7 +44,7 @@ class IngestionDaemon:
         self.storage = storage
         self.client = client
         self.marine = OpenMeteoMarine(client)
-        self.erddap = ErddapClient(client)
+        self.erddap = ErddapClient(client, store=storage)
         self._stop = asyncio.Event()
         self._cycle = 0
 

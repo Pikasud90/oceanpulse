@@ -25,6 +25,7 @@ import datetime as dt
 import io
 from typing import Any, Sequence
 
+import numpy as np
 import pandas as pd
 import pyarrow as pa
 import pyarrow.parquet as pq
@@ -33,6 +34,7 @@ from ..logging_setup import get_logger
 from ..math_engine import (
     INTERVAL_RULES,
     resample_observations,
+    rolling_zscore,
     wave_energy_flux_series,
 )
 from ..storage.base import BoundingBox, ObservationFilter
@@ -92,6 +94,7 @@ def build_dataset(
     interval: str = "1d",
     intensive_fill: str = "none",
     include_forecast: bool = False,
+    derived_features: bool = False,
     max_rows: int = 2_000_000,
 ) -> tuple[pd.DataFrame, dict[str, Any]]:
     """Assemble a dataset and report how it was built."""
@@ -145,9 +148,38 @@ def build_dataset(
             frame["cumulative_wave_energy_kwh_m"] = (
                 frame["wave_energy_kwh_m"].fillna(0.0).cumsum()
             )
+        if derived_features:
+            frame = add_derived_features(frame)
 
     meta["rows"] = len(frame)
+    meta["derived_features"] = bool(derived_features)
     return frame, meta
+
+
+# Columns worth a standardised anomaly: the ones whose *departure* from normal
+# is the interesting signal rather than their absolute value.
+ANOMALY_COLUMNS = ("sst_celsius", "sea_level_anomaly_m", "wave_power_kw_m", "wave_height_m")
+
+
+def add_derived_features(frame: pd.DataFrame, window: int = 30) -> pd.DataFrame:
+    """Add rolling z-scores and a log-energy column for modelling.
+
+    Offered as an option rather than always-on because these are opinionated
+    transforms: the window length is a modelling choice, and a reader who wants
+    the raw series should not have to strip columns back out.
+    """
+    out = frame.copy()
+    for column in ANOMALY_COLUMNS:
+        if column in out.columns and out[column].notna().sum() >= 8:
+            out[f"{column}_z"] = rolling_zscore(
+                out[column].tolist(), window=window, min_periods=5
+            )
+    if "wave_energy_kwh_m" in out.columns:
+        # log1p keeps the zeros that quiet windows legitimately contain.
+        out["log1p_wave_energy_kwh_m"] = np.log1p(
+            out["wave_energy_kwh_m"].clip(lower=0).fillna(0.0)
+        )
+    return out
 
 
 # ---------------------------------------------------------------------------

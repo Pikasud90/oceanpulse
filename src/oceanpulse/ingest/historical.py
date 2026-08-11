@@ -39,6 +39,7 @@ async def backfill_port(
     end: dt.date,
     *,
     include_erddap: bool = True,
+    erddap: ErddapClient | None = None,
 ) -> dict[str, Any]:
     """Fetch whatever this port is missing over `start`..`end`.
 
@@ -88,7 +89,11 @@ async def backfill_port(
     if not include_erddap or not config.erddap_enabled:
         return report
 
-    erddap = ErddapClient(client)
+    # Reuse the caller's client when given one. Building a fresh ErddapClient
+    # per call threw away its resolved-cell and coverage caches, so every
+    # timeline load re-probed the same masked coastline from scratch.
+    if erddap is None:
+        erddap = ErddapClient(client, store=storage)
 
     # -- ERDDAP: long-run sea temperature ---------------------------------
     await _backfill_erddap(

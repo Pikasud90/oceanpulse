@@ -137,7 +137,8 @@ def start_daemon(config, storage):
     from oceanpulse.ingest import runner
     from oceanpulse.ingest.daemon import IngestionDaemon
 
-    client = runner.get_client(config)
+    # Pass storage so the request budget survives restarts.
+    client = runner.get_client(config, storage)
     daemon = IngestionDaemon(config, storage, client)
     future = runner.get_loop().submit(daemon.run())
     return daemon, future

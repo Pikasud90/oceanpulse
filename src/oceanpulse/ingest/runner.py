@@ -21,6 +21,7 @@ from typing import Any, Awaitable, Callable, TypeVar
 from ..config import Config
 from ..logging_setup import get_logger
 from .http import RateLimitedClient
+from .limits import RequestBudget
 
 log = get_logger(__name__)
 
@@ -104,18 +105,26 @@ def get_loop() -> BackgroundLoop:
     return _loop
 
 
-def get_client(config: Config) -> RateLimitedClient:
-    """The single shared, rate-limited HTTP client."""
+def get_client(config: Config, storage: Any | None = None) -> RateLimitedClient:
+    """The single shared, rate-limited HTTP client.
+
+    The request budget is persisted through storage when available, so a
+    restart - or a crash loop - cannot reset a provider's daily quota and let
+    the app hammer a free service it has already used up.
+    """
     global _client
     with _client_lock:
         if _client is None:
+            budget = RequestBudget(
+                load=(lambda key: storage.get_setting(key)) if storage else None,
+                save=(lambda key, value: storage.set_setting(key, value)) if storage else None,
+            )
             _client = RateLimitedClient(
-                rate_per_second=config.rate_limit_per_second,
-                burst=config.rate_limit_burst,
                 timeout=config.http_timeout,
                 max_attempts=config.backoff_max_attempts,
                 backoff_cap=config.backoff_cap_seconds,
                 user_agent=config.user_agent,
+                budget=budget,
             )
         return _client
 

@@ -1,4 +1,13 @@
-"""Shared HTTP client: token bucket, backoff, and honest error classification.
+"""Shared HTTP client: per-provider gating, backoff, and honest error classification.
+
+Politeness is enforced in four independent layers, because each catches
+something the others cannot. See `limits.py` for why one global token bucket is
+not sufficient.
+
+    budget      refuses a request before the provider has to (daily/hourly)
+    semaphore   bounds requests in flight, which a rate limit does not
+    bucket      bounds requests per second
+    backoff     spaces out retries after a failure, with full jitter
 
 The retry policy is where most of the thinking is. The usual rule - 4xx is
 permanent, 5xx is transient - is *wrong* for ERDDAP, which answers
@@ -14,12 +23,13 @@ from __future__ import annotations
 
 import asyncio
 import random
-import time
+from email.utils import parsedate_to_datetime
 from typing import Any, Mapping
 
 import httpx
 
 from ..logging_setup import get_logger
+from .limits import BudgetExceeded, GateRegistry, RequestBudget, limits_for
 
 log = get_logger(__name__)
 
@@ -43,55 +53,54 @@ _ERDDAP_TRANSIENT_MARKERS = (
     "please try again",
 )
 
+# Never sleep longer than this on a server-supplied Retry-After. A provider
+# asking for an hour is telling us to stop for now, not to hold a coroutine and
+# a connection open for an hour.
+MAX_HONOURED_RETRY_AFTER = 120.0
 
-class TokenBucket:
-    """Async token bucket shared across every coroutine that talks outbound.
 
-    Sharing one bucket is the point: parallel chunk fetches must not be able
-    to collectively exceed the sustained rate just because each one
-    individually respects it.
-    """
+def _parse_retry_after(value: str | None) -> float | None:
+    """Retry-After is either delta-seconds or an HTTP date. Support both."""
+    if not value:
+        return None
+    value = value.strip()
+    try:
+        return max(0.0, float(value))
+    except ValueError:
+        pass
+    try:
+        when = parsedate_to_datetime(value)
+    except (TypeError, ValueError):
+        return None
+    if when is None:
+        return None
+    import datetime as dt
 
-    def __init__(self, rate_per_second: float = 2.0, burst: int = 4) -> None:
-        self.rate = max(0.1, float(rate_per_second))
-        self.capacity = max(1, int(burst))
-        self._tokens = float(self.capacity)
-        self._updated = time.monotonic()
-        self._lock = asyncio.Lock()
-
-    async def acquire(self, tokens: float = 1.0) -> None:
-        async with self._lock:
-            while True:
-                now = time.monotonic()
-                elapsed = now - self._updated
-                self._updated = now
-                self._tokens = min(self.capacity, self._tokens + elapsed * self.rate)
-                if self._tokens >= tokens:
-                    self._tokens -= tokens
-                    return
-                await asyncio.sleep((tokens - self._tokens) / self.rate)
+    if when.tzinfo is None:
+        when = when.replace(tzinfo=dt.timezone.utc)
+    return max(0.0, (when - dt.datetime.now(dt.timezone.utc)).total_seconds())
 
 
 class RateLimitedClient:
-    """httpx wrapper with rate limiting, retries and conditional GET."""
+    """httpx wrapper with per-provider gating, retries and conditional GET."""
 
     def __init__(
         self,
-        rate_per_second: float = 2.0,
-        burst: int = 4,
         timeout: float = 60.0,
         max_attempts: int = 8,
         backoff_cap: float = 900.0,
         user_agent: str = "OceanPulse/1.0",
+        budget: RequestBudget | None = None,
     ) -> None:
-        self.bucket = TokenBucket(rate_per_second, burst)
         self.timeout = timeout
         self.max_attempts = max(1, int(max_attempts))
         self.backoff_cap = float(backoff_cap)
         self.user_agent = user_agent
+        self.gates = GateRegistry()
+        self.budget = budget if budget is not None else RequestBudget()
         self._client: httpx.AsyncClient | None = None
-        # Last-Modified per URL, for conditional requests.
-        self._last_modified: dict[str, str] = {}
+        # Last-Modified / ETag per URL, for conditional requests.
+        self._validators: dict[str, dict[str, str]] = {}
 
     async def __aenter__(self) -> "RateLimitedClient":
         await self.start()
@@ -106,6 +115,9 @@ class RateLimitedClient:
                 timeout=httpx.Timeout(self.timeout),
                 headers={"User-Agent": self.user_agent, "Accept-Encoding": "gzip, deflate"},
                 follow_redirects=True,
+                # Bounded pool: a self-hosted collector has no business holding
+                # dozens of sockets open against a research server.
+                limits=httpx.Limits(max_connections=4, max_keepalive_connections=2),
             )
 
     async def close(self) -> None:
@@ -123,22 +135,39 @@ class RateLimitedClient:
     ) -> httpx.Response:
         await self.start()
         assert self._client is not None
-        headers: dict[str, str] = {}
-        if conditional and url in self._last_modified:
-            headers["If-Modified-Since"] = self._last_modified[url]
 
-        await self.bucket.acquire()
-        try:
-            response = await self._client.get(url, params=params, headers=headers)
-        except (httpx.TimeoutException, httpx.NetworkError, httpx.RemoteProtocolError) as exc:
-            raise TransientError(f"network error for {url}: {exc}") from exc
+        gate = self.gates.gate_for(url)
+        # Budget first: if the quota is spent there is no point queueing.
+        self.budget.check(gate.limits)
+
+        headers: dict[str, str] = {}
+        if conditional:
+            for header, value in self._validators.get(url, {}).items():
+                headers[header] = value
+
+        async with gate.semaphore:
+            await gate.bucket.acquire()
+            self.budget.record(gate.limits)
+            try:
+                response = await self._client.get(url, params=params, headers=headers)
+            except (
+                httpx.TimeoutException,
+                httpx.NetworkError,
+                httpx.RemoteProtocolError,
+            ) as exc:
+                raise TransientError(
+                    f"network error for {url}: {type(exc).__name__}: {exc}"
+                ) from exc
 
         if response.status_code == 304:
             raise NotModified(url)
 
         if response.status_code == 429:
-            retry_after = response.headers.get("Retry-After")
-            raise TransientError(f"rate limited (Retry-After={retry_after})")
+            delay = _parse_retry_after(response.headers.get("Retry-After"))
+            raise TransientError(
+                f"HTTP 429 rate limited by {gate.limits.name}"
+                + (f", Retry-After={delay:.0f}s" if delay else ""),
+            )
 
         if response.status_code >= 500:
             raise TransientError(f"HTTP {response.status_code} from {url}")
@@ -152,12 +181,18 @@ class RateLimitedClient:
                     f"HTTP {response.status_code} but transient upstream state: "
                     f"{response.text[:160].strip()}"
                 )
-            raise PermanentError(f"HTTP {response.status_code} from {url}: {response.text[:200]}")
+            raise PermanentError(
+                f"HTTP {response.status_code} from {url}: {response.text[:200]}"
+            )
 
         if conditional:
-            last_modified = response.headers.get("Last-Modified")
-            if last_modified:
-                self._last_modified[url] = last_modified
+            validators: dict[str, str] = {}
+            if response.headers.get("Last-Modified"):
+                validators["If-Modified-Since"] = response.headers["Last-Modified"]
+            if response.headers.get("ETag"):
+                validators["If-None-Match"] = response.headers["ETag"]
+            if validators:
+                self._validators[url] = validators
 
         # ERDDAP also returns error documents with a 200 status.
         if response.text[:64].lstrip().startswith("Error {"):
@@ -186,13 +221,16 @@ class RateLimitedClient:
         unknown datasetID" is classified transient, so a caller that has an
         equivalent variant available would otherwise spend minutes backing off
         against the broken one before ever reaching the one that works.
+
+        A spent local budget is never retried - waiting would not help, and the
+        whole point is to stop.
         """
         attempts = self.max_attempts if max_attempts is None else max(1, int(max_attempts))
         last_error: Exception | None = None
         for attempt in range(attempts):
             try:
                 return await self._request_once(url, params, conditional)
-            except PermanentError:
+            except (PermanentError, BudgetExceeded):
                 raise
             except TransientError as exc:
                 last_error = exc
@@ -200,6 +238,13 @@ class RateLimitedClient:
                     break
                 ceiling = min(self.backoff_cap, 2.0**attempt)
                 delay = random.uniform(0.0, ceiling)
+                # Honour an explicit Retry-After over our own guess.
+                if "Retry-After=" in str(exc):
+                    try:
+                        asked = float(str(exc).split("Retry-After=")[1].rstrip("s ,"))
+                        delay = min(MAX_HONOURED_RETRY_AFTER, max(delay, asked))
+                    except (IndexError, ValueError):
+                        pass
                 log.warning(
                     "%s (attempt %d/%d), retrying in %.1fs",
                     exc,
@@ -244,3 +289,16 @@ class RateLimitedClient:
     ) -> bytes:
         response = await self.get(url, params=params)
         return response.content
+
+    # -- introspection ----------------------------------------------------
+
+    def budget_snapshot(self) -> list[dict[str, object]]:
+        return self.budget.snapshot()
+
+    def describe_limits(self, url: str) -> str:
+        limits = limits_for(url)
+        return (
+            f"{limits.name}: {limits.rate_per_second}/s, "
+            f"{limits.max_concurrent} concurrent, "
+            f"{limits.daily_budget}/day ({limits.published_note})"
+        )

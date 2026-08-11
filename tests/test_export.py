@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import datetime as dt
+import json
 import io
 
 import pandas as pd
@@ -196,6 +197,100 @@ def test_empty_and_populated_exports_share_a_schema(populated):
     assert meta["matched_observations"] == 0
     assert set(busy.columns) == set(quiet.columns)
     assert to_parquet_bytes(quiet)
+
+
+def test_bundle_carries_everything_needed_to_interpret_it(populated):
+    """A CSV of numbers is not a dataset.
+
+    Units, provenance and caveats have to travel with the rows, or nobody -
+    including the person who exported it - can reuse them six months later.
+    """
+    import zipfile
+
+    from oceanpulse.exporting.manifest import build_bundle
+
+    start, end = _window()
+    frame, meta = build_dataset(populated, start=start, end=end, mode="aggregated",
+                                interval="1d")
+    spec = {"scope_mode": "global", "interval": "1d"}
+    payload = build_bundle(frame, spec, meta, to_parquet_bytes(frame), "data.parquet")
+
+    with zipfile.ZipFile(io.BytesIO(payload)) as bundle:
+        names = set(bundle.namelist())
+        assert names == {"data.parquet", "manifest.json", "data_dictionary.csv", "README.txt"}
+
+        manifest = json.loads(bundle.read("manifest.json"))
+        assert manifest["result"]["rows"] == len(frame)
+        assert manifest["query"] == spec
+        assert manifest["providers"], "an export must name its data providers"
+        assert manifest["caveats"], "an export must carry its caveats"
+        # The direction conventions differ between waves and currents; that has
+        # to be written down or the data will be misread.
+        assert "FROM" in manifest["conventions"]["wave_direction"]
+        assert "TOWARD" in manifest["conventions"]["current_direction"]
+
+        readme = bundle.read("README.txt").decode()
+        assert "OceanPulse data export" in readme
+        assert "Caveats" in readme
+
+        dictionary = bundle.read("data_dictionary.csv").decode()
+        assert "nature" in dictionary.splitlines()[0]
+
+
+def test_data_dictionary_covers_every_exported_column(populated):
+    """A column with no dictionary entry is a column nobody can trust."""
+    from oceanpulse.exporting.manifest import dictionary_for
+
+    start, end = _window()
+    for mode in ("raw", "aggregated"):
+        frame, _ = build_dataset(populated, start=start, end=end, mode=mode,
+                                 interval="1d", derived_features=True)
+        table = dictionary_for(list(frame.columns))
+        assert list(table["column"]) == list(frame.columns)
+        assert table["nature"].isin(
+            {"measurement", "analysis", "model", "derived", "metadata"}
+        ).all()
+        assert (table["description"].str.len() > 0).all()
+
+
+def test_nature_distinguishes_measurement_from_model(populated):
+    """The single most important field for honest reuse.
+
+    Satellite altimetry, a wave model and something this software computed
+    deserve very different amounts of trust.
+    """
+    from oceanpulse.exporting.manifest import dictionary_for
+
+    table = dictionary_for(
+        ["sea_level_anomaly_m", "wave_height_m", "wave_power_kw_m", "sst_celsius"]
+    ).set_index("column")
+    assert table.loc["sea_level_anomaly_m", "nature"] == "measurement"
+    assert table.loc["wave_height_m", "nature"] == "model"
+    assert table.loc["wave_power_kw_m", "nature"] == "derived"
+    assert table.loc["sst_celsius", "nature"] == "analysis"
+
+
+def test_derived_features_are_opt_in(populated):
+    """Hourly gives enough points for a rolling statistic; daily does not."""
+    start, end = _window()
+    plain, _ = build_dataset(populated, start=start, end=end, mode="aggregated",
+                             interval="1h")
+    rich, meta = build_dataset(populated, start=start, end=end, mode="aggregated",
+                               interval="1h", derived_features=True)
+    assert meta["derived_features"] is True
+    added = set(rich.columns) - set(plain.columns)
+    assert any(name.endswith("_z") for name in added), added
+    assert "log1p_wave_energy_kwh_m" in added
+    # log1p keeps the genuine zeros that quiet windows contain.
+    assert (rich["log1p_wave_energy_kwh_m"] >= 0).all()
+
+
+def test_derived_features_refuse_a_series_too_short_to_standardise(populated):
+    """A z-score from three points is noise wearing a statistic's clothes."""
+    start, end = _window()
+    short, _ = build_dataset(populated, start=start, end=end, mode="aggregated",
+                             interval="1w", derived_features=True)
+    assert not [c for c in short.columns if c.endswith("_z")]
 
 
 def test_suggested_filenames_are_safe():

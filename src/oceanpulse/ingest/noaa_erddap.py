@@ -24,15 +24,26 @@ from __future__ import annotations
 import csv
 import datetime as dt
 import io
+import time
 from dataclasses import dataclass, field
 from typing import Any, Sequence
 
 from ..config import ERDDAP_HOSTS
 from ..logging_setup import get_logger
+from ..math_engine import haversine_km
 from ..models import MarineObservation
 from .http import PermanentError, RateLimitedClient, TransientError
 
 log = get_logger(__name__)
+
+# How far to look for an unmasked cell, and over how long a window. Half a
+# degree either side is two OISST cells - enough to step off a masked
+# coastline without silently reading the open ocean tens of kilometres away.
+PROBE_HALF_SPAN_DEG = 0.75
+PROBE_WINDOW_DAYS = 10
+
+# Distinguishes "cached as unavailable" (None) from "not cached at all".
+_MISSING = object()
 
 
 @dataclass(frozen=True)
@@ -108,9 +119,17 @@ def _range_subset(start: str, end: str, stride: int = 1) -> str:
 class ErddapClient:
     """Point and grid extraction with mirror and convention failover."""
 
-    def __init__(self, client: RateLimitedClient, hosts: Sequence[str] = ERDDAP_HOSTS) -> None:
+    def __init__(
+        self,
+        client: RateLimitedClient,
+        hosts: Sequence[str] = ERDDAP_HOSTS,
+        store: Any | None = None,
+    ) -> None:
         self.client = client
         self.hosts = tuple(hosts)
+        # Optional key/value store (the SQLite backend) used to remember
+        # resolved cells and dataset coverage across restarts.
+        self.store = store
         self._time_ranges: dict[str, tuple[dt.datetime, dt.datetime]] = {}
         # (kind, lat, lon) -> the cell that actually holds data, or None.
         self._resolved_cells: dict[
@@ -128,6 +147,11 @@ class ErddapClient:
         if kind in self._time_ranges:
             return self._time_ranges[kind]
 
+        cached = self._load_time_range(kind)
+        if cached is not None:
+            self._time_ranges[kind] = cached
+            return cached
+
         for dataset in DATASETS.get(kind, ()):
             for host in self.hosts:
                 url = f"{host}/info/{dataset.dataset_id}/index.csv"
@@ -139,6 +163,7 @@ class ErddapClient:
                 bounds = _parse_time_actual_range(text)
                 if bounds:
                     self._time_ranges[kind] = bounds
+                    self._store_time_range(kind, bounds)
                     log.info(
                         "%s coverage: %s .. %s",
                         kind,
@@ -148,6 +173,43 @@ class ErddapClient:
                     return bounds
         log.warning("could not determine coverage for ERDDAP dataset kind %r", kind)
         return None
+
+    # -- coverage caching --------------------------------------------------
+
+    # Coverage only grows, by a day or so at a time, so re-asking every few
+    # hours is plenty. Without this, every timeline load spent two requests
+    # re-discovering that OISST still starts in 1981.
+    _COVERAGE_TTL_SECONDS = 6 * 3600
+
+    def _load_time_range(self, kind: str) -> tuple[dt.datetime, dt.datetime] | None:
+        if self.store is None:
+            return None
+        raw = self.store.get_setting(f"erddap_coverage:{kind}")
+        if not raw:
+            return None
+        try:
+            fetched_at, low, high = raw.split("|")
+            if time.time() - float(fetched_at) > self._COVERAGE_TTL_SECONDS:
+                return None
+            return (
+                dt.datetime.fromisoformat(low),
+                dt.datetime.fromisoformat(high),
+            )
+        except (TypeError, ValueError):
+            return None
+
+    def _store_time_range(
+        self, kind: str, bounds: tuple[dt.datetime, dt.datetime]
+    ) -> None:
+        if self.store is None:
+            return
+        try:
+            self.store.set_setting(
+                f"erddap_coverage:{kind}",
+                f"{time.time():.0f}|{bounds[0].isoformat()}|{bounds[1].isoformat()}",
+            )
+        except Exception as exc:  # noqa: BLE001
+            log.debug("could not persist coverage: %s", exc)
 
     # -- point series -----------------------------------------------------
 
@@ -168,40 +230,153 @@ class ErddapClient:
         coastal ports the application exists to look at - and the failure looks
         identical to a broken fetch.
 
-        Probes a ten-day window, nearest candidate first, and caches the answer.
+        **One request, not a walk.** The first implementation probed up to 33
+        candidate points one at a time. Each ERDDAP round trip takes several
+        seconds, so resolving two datasets for one port cost two to four
+        minutes of the user staring at a spinner, and it did that again on
+        every timeline load. griddap can subset a *range* of latitudes and
+        longitudes in a single query, so the whole neighbourhood arrives at
+        once and the nearest cell with data is picked locally. Same answer,
+        one request instead of dozens, and far gentler on the server.
+
+        The answer is cached in memory and, when a store is attached, on disk -
+        a masked coastline does not move, so this should be paid once per port
+        per dataset and never again.
         """
         cache_key = (kind, round(latitude, 3), round(longitude, 3))
         if cache_key in self._resolved_cells:
             return self._resolved_cells[cache_key]
 
-        probe_start = probe_end - dt.timedelta(days=10)
-        candidates: list[tuple[float, float]] = [(latitude, longitude)]
-        for step in (0.25, 0.5, 1.0, 1.5):
-            for dlat, dlon in (
-                (0.0, -step), (0.0, step), (-step, 0.0), (step, 0.0),
-                (-step, -step), (-step, step), (step, -step), (step, step),
-            ):
-                lat = max(-89.8, min(89.8, latitude + dlat))
-                lon = ((longitude + dlon + 180.0) % 360.0) - 180.0
-                candidates.append((round(lat, 4), round(lon, 4)))
+        stored = self._load_cell(cache_key)
+        if stored is not _MISSING:
+            self._resolved_cells[cache_key] = stored
+            return stored
 
-        for lat, lon in candidates:
-            rows = await self._fetch_chunk(kind, lat, lon, probe_start, probe_end)
-            if _rows_to_observations(rows, port_id=None, source_kind=kind):
-                if (lat, lon) != (latitude, longitude):
-                    log.info(
-                        "%s: %.3f,%.3f is masked; reading from %.3f,%.3f instead",
-                        kind, latitude, longitude, lat, lon,
-                    )
-                self._resolved_cells[cache_key] = (lat, lon)
-                return (lat, lon)
-
-        log.info(
-            "%s: no cell with data within 1.5 degrees of %.3f,%.3f",
-            kind, latitude, longitude,
+        probe_start = probe_end - dt.timedelta(days=PROBE_WINDOW_DAYS)
+        found = await self._nearest_cell_with_data(
+            kind, latitude, longitude, probe_start, probe_end
         )
-        self._resolved_cells[cache_key] = None
+
+        if found is None:
+            log.info(
+                "%s: no cell with data within %.2f deg of %.3f,%.3f",
+                kind, PROBE_HALF_SPAN_DEG, latitude, longitude,
+            )
+        elif (round(found[0], 3), round(found[1], 3)) != (
+            round(latitude, 3), round(longitude, 3)
+        ):
+            log.info(
+                "%s: %.3f,%.3f is masked; reading from %.3f,%.3f instead",
+                kind, latitude, longitude, found[0], found[1],
+            )
+
+        self._resolved_cells[cache_key] = found
+        self._store_cell(cache_key, found)
+        return found
+
+    async def _nearest_cell_with_data(
+        self,
+        kind: str,
+        latitude: float,
+        longitude: float,
+        start: dt.date,
+        end: dt.date,
+    ) -> tuple[float, float] | None:
+        """Fetch a small neighbourhood in one query and pick the closest cell."""
+        half = PROBE_HALF_SPAN_DEG
+        lat_min = max(-89.8, latitude - half)
+        lat_max = min(89.8, latitude + half)
+
+        for dataset, host in self._variants(kind):
+            lon_centre = dataset.encode_longitude(longitude)
+            lon_min, lon_max = lon_centre - half, lon_centre + half
+            # A box spanning the 0/360 or +/-180 seam would need two queries;
+            # a port that close to the seam is rare enough to simply clamp.
+            if dataset.lon_convention == "0360":
+                lon_min, lon_max = max(0.0, lon_min), min(359.9, lon_max)
+            else:
+                lon_min, lon_max = max(-179.9, lon_min), min(179.9, lon_max)
+            if lon_min > lon_max:
+                continue
+
+            dim_subset = ""
+            for dim in dataset.extra_dims:
+                if dim in dataset.fixed_dims:
+                    dim_subset += _subset(dataset.fixed_dims[dim])
+                elif dim == "latitude":
+                    dim_subset += _range_subset(f"{lat_min:.4f}", f"{lat_max:.4f}")
+                elif dim == "longitude":
+                    dim_subset += _range_subset(f"{lon_min:.4f}", f"{lon_max:.4f}")
+            time_subset = _range_subset(start.isoformat(), end.isoformat())
+            # One variable is enough to establish whether the cell is masked.
+            variable = dataset.variables[0]
+            query = f"{variable}{time_subset}{dim_subset}"
+            url = f"{host}/griddap/{dataset.dataset_id}.csv?{query}"
+
+            try:
+                text = await self.client.get_text(url, max_attempts=1)
+            except (TransientError, PermanentError) as exc:
+                log.debug("area probe failed on %s: %s", dataset.dataset_id, exc)
+                continue
+
+            best: tuple[float, tuple[float, float]] | None = None
+            for row in _parse_griddap_csv(text):
+                raw = row.get(variable)
+                if raw in (None, "", "NaN", "nan"):
+                    continue
+                try:
+                    float(raw)
+                    row_lat = float(row["latitude"])
+                    row_lon = float(row["longitude"])
+                except (KeyError, TypeError, ValueError):
+                    continue
+                if dataset.lon_convention == "0360":
+                    row_lon = ((row_lon + 180.0) % 360.0) - 180.0
+                distance = haversine_km(latitude, longitude, row_lat, row_lon)
+                if best is None or distance < best[0]:
+                    best = (distance, (round(row_lat, 4), round(row_lon, 4)))
+            if best is not None:
+                return best[1]
         return None
+
+    def _variants(self, kind: str) -> list[tuple[ErddapDataset, str]]:
+        return [
+            (dataset, host)
+            for dataset in DATASETS.get(kind, ())
+            for host in self.hosts
+        ]
+
+    # -- resolved-cell persistence ----------------------------------------
+
+    @staticmethod
+    def _cell_setting_key(cache_key: tuple[str, float, float]) -> str:
+        kind, lat, lon = cache_key
+        return f"erddap_cell:{kind}:{lat:.3f},{lon:.3f}"
+
+    def _load_cell(self, cache_key: tuple[str, float, float]) -> Any:
+        if self.store is None:
+            return _MISSING
+        raw = self.store.get_setting(self._cell_setting_key(cache_key))
+        if raw is None:
+            return _MISSING
+        if raw == "none":
+            return None
+        try:
+            lat_text, lon_text = raw.split(",")
+            return (float(lat_text), float(lon_text))
+        except (TypeError, ValueError):
+            return _MISSING
+
+    def _store_cell(
+        self, cache_key: tuple[str, float, float], value: tuple[float, float] | None
+    ) -> None:
+        if self.store is None:
+            return
+        payload = "none" if value is None else f"{value[0]:.4f},{value[1]:.4f}"
+        try:
+            self.store.set_setting(self._cell_setting_key(cache_key), payload)
+        except Exception as exc:  # noqa: BLE001 - caching must not break a fetch
+            log.debug("could not persist resolved cell: %s", exc)
 
     async def fetch_point_series(
         self,

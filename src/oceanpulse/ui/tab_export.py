@@ -20,6 +20,7 @@ from ..exporting.aggregate import (
     to_csv_bytes,
     to_parquet_bytes,
 )
+from ..exporting.manifest import build_bundle, dictionary_for
 from ..logging_setup import get_logger
 from ..storage.base import BoundingBox
 from . import theme
@@ -165,12 +166,25 @@ def layout(services: Services) -> html.Div:
                             ),
                             html.Div(
                                 [
-                                    html.Label("Forecast rows"),
+                                    html.Label("Extra columns"),
                                     dcc.Checklist(
                                         id="export-forecast",
-                                        options=[{"label": " Include", "value": "yes"}],
+                                        options=[
+                                            {"label": " Forecast rows", "value": "yes"},
+                                        ],
                                         value=[],
                                         inputStyle={"marginRight": "5px"},
+                                        labelStyle={"display": "block"},
+                                    ),
+                                    dcc.Checklist(
+                                        id="export-derived",
+                                        options=[
+                                            {"label": " Rolling z-scores + log energy",
+                                             "value": "yes"},
+                                        ],
+                                        value=[],
+                                        inputStyle={"marginRight": "5px"},
+                                        labelStyle={"display": "block"},
                                     ),
                                 ],
                                 className="op-field",
@@ -203,9 +217,13 @@ def layout(services: Services) -> html.Div:
                 [
                     html.Div(
                         [
-                            html.Button("Download CSV", id="export-csv",
-                                        className="op-button secondary", n_clicks=0),
-                            html.Button("Download Parquet", id="export-parquet",
+                            html.Button("Download bundle (.zip)", id="export-bundle",
+                                        className="op-button", n_clicks=0,
+                                        title="Parquet + manifest + data dictionary + README"),
+                            html.Button("CSV only", id="export-csv",
+                                        className="op-button secondary", n_clicks=0,
+                                        style={"marginLeft": "8px"}),
+                            html.Button("Parquet only", id="export-parquet",
                                         className="op-button secondary", n_clicks=0,
                                         style={"marginLeft": "8px"}),
                             dcc.Input(id="export-save-name", type="text",
@@ -222,9 +240,32 @@ def layout(services: Services) -> html.Div:
                         type="dot",
                         color=theme.ACCENT,
                     ),
+                    html.Div(
+                        "The bundle is the recommended download: it carries the "
+                        "rows plus a manifest, a data dictionary giving every "
+                        "column's unit, provider and whether it was measured, "
+                        "modelled or derived, and a plain-text README with the "
+                        "caveats. Six months from now that is the difference "
+                        "between a dataset and a pile of numbers.",
+                        className="op-note",
+                        style={"marginTop": "12px"},
+                    ),
                     html.Div(id="export-preview", className="op-scroll",
                              style={"marginTop": "12px"}),
                     dcc.Download(id="export-download"),
+                ],
+                className="op-card",
+            ),
+            html.Div(className="op-spacer"),
+            html.Div(
+                [
+                    html.Div("Data dictionary", className="op-card-title"),
+                    html.Div(
+                        "What each column in the current result means. Ships "
+                        "inside the bundle as data_dictionary.csv.",
+                        className="op-card-sub",
+                    ),
+                    html.Div(id="export-dictionary", className="op-scroll"),
                 ],
                 className="op-card",
             ),
@@ -257,6 +298,7 @@ def _collect_spec(
     interval: str,
     fill: str,
     forecast: list[str],
+    derived: list[str],
 ) -> dict[str, Any]:
     return {
         "scope_mode": scope_mode,
@@ -271,6 +313,7 @@ def _collect_spec(
         "interval": interval,
         "fill": fill,
         "include_forecast": bool(forecast),
+        "derived_features": bool(derived),
     }
 
 
@@ -303,6 +346,7 @@ def _run_spec(services: Services, spec: dict[str, Any]) -> tuple[pd.DataFrame, d
         interval=spec.get("interval", "1d"),
         intensive_fill=spec.get("fill", "none"),
         include_forecast=spec.get("include_forecast", False),
+        derived_features=spec.get("derived_features", False),
         max_rows=services.config.max_export_rows,
     )
 
@@ -325,6 +369,49 @@ def _preview_table(frame: pd.DataFrame, limit: int = 25) -> Any:
                         ]
                     )
                     for row in head.itertuples(index=False)
+                ]
+            ),
+        ],
+        className="op-table",
+    )
+
+
+def _dictionary_table(frame: pd.DataFrame) -> Any:
+    """Show the same dictionary that ships inside the bundle."""
+    if frame.empty:
+        return html.Div("Load a dataset to see its columns.", className="op-kpi-sub")
+    table = dictionary_for(list(frame.columns))
+    nature_colour = {
+        "measurement": theme.SUCCESS,
+        "analysis": theme.ACCENT,
+        "model": theme.WARNING,
+        "derived": theme.VIOLET,
+        "metadata": theme.TEXT_MUTED,
+    }
+    return html.Table(
+        [
+            html.Thead(
+                html.Tr([html.Th(h) for h in
+                         ("Column", "Unit", "Nature", "Provider", "Meaning")])
+            ),
+            html.Tbody(
+                [
+                    html.Tr(
+                        [
+                            html.Td(row["column"]),
+                            html.Td(row["unit"] or "—"),
+                            html.Td(
+                                row["nature"],
+                                style={"color": nature_colour.get(row["nature"],
+                                                                  theme.TEXT_MUTED),
+                                       "fontWeight": 620},
+                            ),
+                            html.Td(row["provider"]),
+                            html.Td(row["description"],
+                                    style={"whiteSpace": "normal", "maxWidth": "460px"}),
+                        ]
+                    )
+                    for _, row in table.iterrows()
                 ]
             ),
         ],
@@ -356,6 +443,7 @@ def register(app: Any, services: Services) -> None:
     @app.callback(
         Output("export-status", "children"),
         Output("export-preview", "children"),
+        Output("export-dictionary", "children"),
         Output("export-spec", "data"),
         Input("export-load", "n_clicks"),
         State("export-scope-mode", "value"),
@@ -370,21 +458,24 @@ def register(app: Any, services: Services) -> None:
         State("export-interval", "value"),
         State("export-fill", "value"),
         State("export-forecast", "value"),
+        State("export-derived", "value"),
         prevent_initial_call=True,
     )
     def _load(_clicks, scope_mode, port_id, min_lat, max_lat, min_lon, max_lon,
-              start, end, mode, interval, fill, forecast):
+              start, end, mode, interval, fill, forecast, derived):
         spec = _collect_spec(
             scope_mode, port_id, (min_lat, max_lat, min_lon, max_lon),
-            start, end, mode, interval, fill, forecast,
+            start, end, mode, interval, fill, forecast, derived,
         )
         if scope_mode == "port" and not port_id:
-            return html.Div("Select a tracked port first.", className="op-note warn"), None, None
+            return (html.Div("Select a tracked port first.", className="op-note warn"),
+                    None, None, None)
         try:
             frame, meta = _run_spec(services, spec)
         except Exception as exc:  # noqa: BLE001
             log.exception("export build failed")
-            return html.Div(f"Could not build dataset: {exc}", className="op-note warn"), None, None
+            return (html.Div(f"Could not build dataset: {exc}", className="op-note warn"),
+                    None, None, None)
 
         note = (
             f"{meta['rows']:,} rows from {meta['matched_observations']:,} observations · "
@@ -392,25 +483,34 @@ def register(app: Any, services: Services) -> None:
         )
         if meta.get("truncated"):
             note += " · truncated at the row cap"
-        return html.Div(note, className="op-note"), _preview_table(frame), spec
+        return (html.Div(note, className="op-note"), _preview_table(frame),
+                _dictionary_table(frame), spec)
 
     @app.callback(
         Output("export-download", "data"),
         Input("export-csv", "n_clicks"),
         Input("export-parquet", "n_clicks"),
+        Input("export-bundle", "n_clicks"),
         State("export-spec", "data"),
         prevent_initial_call=True,
     )
-    def _download(csv_clicks, parquet_clicks, spec):
+    def _download(csv_clicks, parquet_clicks, bundle_clicks, spec):
         from dash import callback_context
 
         if not spec:
             return no_update
         triggered = callback_context.triggered_id
-        frame, _ = _run_spec(services, spec)
+        frame, meta = _run_spec(services, spec)
         if frame.empty:
             return no_update
         scope = spec.get("port_id") or spec.get("scope_mode") or "dataset"
+        if triggered == "export-bundle":
+            payload = build_bundle(
+                frame, spec, meta,
+                to_parquet_bytes(frame),
+                suggest_filename(scope, "parquet"),
+            )
+            return dcc.send_bytes(payload, suggest_filename(scope, "zip"))
         if triggered == "export-parquet":
             return dcc.send_bytes(
                 to_parquet_bytes(frame), suggest_filename(scope, "parquet")

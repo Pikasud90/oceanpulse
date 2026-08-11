@@ -4,10 +4,11 @@
 
 OceanPulse runs entirely on your own machine. A background daemon continuously
 samples the global ocean — waves, currents and sea-surface temperature — into a
-local time-series database, and a four-tab web interface lets you watch global
+local time-series database, and a five-tab web interface lets you watch global
 sea state live, drill into any port's history using an offline search over
 20,000 ports and coastal places, correlate the physics, and export clean
-datasets for time-series modelling.
+datasets for time-series modelling — with a built-in encyclopedia
+explaining every quantity it shows you.
 
 It costs nothing to run, requires no API keys, no accounts and no cloud
 services. Every data source it uses is free and public.
@@ -27,7 +28,7 @@ end.
 2. [Installation](#2-installation)
 3. [What happens on first run](#3-what-happens-on-first-run)
 4. [Using the application](#4-using-the-application)
-5. [Glossary](#5-glossary)
+5. [Glossary and encyclopedia](#5-glossary-and-encyclopedia)
 6. [The settings bar](#6-the-settings-bar)
 7. [Running as a background service](#7-running-as-a-background-service)
 8. [Configuration reference](#8-configuration-reference)
@@ -38,7 +39,7 @@ end.
 11. [Architecture](#11-architecture)
 12. [Data sources and APIs](#12-data-sources-and-apis)
 13. [What the data actually is](#13-what-the-data-actually-is)
-14. [Polling strategy and rate limits](#14-polling-strategy-and-rate-limits)
+14. [Polling, rate limits and being a good citizen](#14-polling-rate-limits-and-being-a-good-citizen)
 15. [The sampling grid and the ocean mask](#15-the-sampling-grid-and-the-ocean-mask)
 16. [Historical fetching and the cache ledger](#16-historical-fetching-and-the-cache-ledger)
 17. [The offline gazetteer](#17-the-offline-gazetteer)
@@ -179,17 +180,28 @@ A live view of the current state of the world ocean, refreshed every 60 seconds
 | **Sampled cells** | How many grid points are reporting, and how recently |
 
 **The map.** Switch between a flat world map and a rotatable globe. Points are
-coloured by sea temperature, wave power or wave height, and faint blue arrows
-show ocean current direction and relative speed. Hover any point for its full
-set of values.
+coloured by sea temperature, wave power, wave height or current speed.
+
+**Click any point** for a detail panel: every reading for that cell, a compass
+showing wave and current direction together, and the nearest port with its
+bearing and distance — so a dot becomes a place rather than a pair of signed
+decimals.
+
+**Current arrows** are their own layer, split into labelled speed bands with
+their own colours and a legend. Density is adjustable (off / strongest only /
+normal / all cells) and the sample points can be hidden entirely. Drawing a few
+hundred dots and a few hundred single-colour arrows together produces noise, not
+a flow field; a field you can read beats a field with more data in it.
 
 The points are a **sparse sample, not a continuous field**. OceanPulse polls a
 few hundred cells spread evenly over the ocean; the gaps between them are not
 measurements, and the map does not pretend otherwise by interpolating.
 
-**Severe sea state.** The right-hand panel lists every cell reporting a
-significant wave height above 5 metres, largest first. In practice this is
-almost always the Southern Ocean.
+**Severe sea state.** The right-hand panel lists every cell at or above 5 m
+significant wave height, largest first, each labelled with its Douglas sea-state
+word (Rough, Very high, Phenomenal…) and the distance to the nearest named port.
+**Click a row to expand it** into the full set of readings for that cell. In
+practice the list is almost always the Southern Ocean.
 
 **Wave power distribution.** The histogram at the bottom shows how energy flux
 is distributed across the sampled cells. It is strongly right-skewed: most of
@@ -259,6 +271,22 @@ surge allowance — against a daily maximum still-water proxy.
 > beach slope, which is not available here. **It is not a flood forecast and
 > must not be used for any life-safety decision.**
 
+### Tab 5 — Ocean Encyclopedia
+
+A searchable reference for everything the tool can show you, written in plain
+language: how anyone knows anything about the ocean at all, what significant
+wave height actually means, why the slope of the sea surface reveals currents,
+how OISST is assembled, why sea level is reported as an anomaly, what a marine
+heatwave is and how this tool's approximation differs from the published
+definition, and what actually floods a harbour.
+
+Alongside it, a **glossary** of every symbol, unit and label used anywhere in
+the interface — searchable by unit (`kW/m`), symbol (`Hs`, `SLA`) or concept
+(`altimetry`, `geostrophic`).
+
+Each entry says how the quantity is known and where the limits are, because a
+figure you cannot calibrate your trust in is not much use.
+
 ### Tab 4 — Data Export
 
 Turns the observation log into the uniform matrix that machine-learning models
@@ -274,8 +302,26 @@ expect, and writes it out as CSV or Parquet.
 | **Gaps in intensive columns** | Leave empty / Forward fill / Linear interpolation / Zero fill | How to represent windows with no measurement |
 | **Forecast rows** | Include or exclude | Future hours from the wave model |
 
-Press **Load data** for a preview, then **Download CSV** or **Download
-Parquet**.
+Press **Load data** for a preview and a data dictionary, then download.
+
+**Download the bundle (.zip)** — this is the recommended option. It contains:
+
+| File | Contents |
+|---|---|
+| `*.parquet` | the rows |
+| `manifest.json` | the exact query, row count, period covered, conventions, providers, licences and caveats |
+| `data_dictionary.csv` | one row per column: unit, provider, meaning, and **whether the value was measured, analysed, modelled or derived** |
+| `README.txt` | the same information in prose, for whoever opens the zip |
+
+That `nature` field is the one that matters for honest reuse: satellite
+altimetry, wave-model output and something this software computed deserve very
+different amounts of trust, and six months later nobody remembers which was
+which. CSV-only and Parquet-only downloads remain available.
+
+**Extra columns** can add rolling z-scores and a log-transformed energy column
+for modelling. These are opt-in because the window length is a modelling
+choice, and a series too short to standardise gets no z-score rather than a
+meaningless one.
 
 **Saved datasets.** Name a configuration and click *Save definition* to keep
 it. A saved dataset stores the **query, not the rows** — re-running it later
@@ -289,7 +335,10 @@ spreadsheets.
 
 ---
 
-## 5. Glossary
+## 5. Glossary and encyclopedia
+
+The full, searchable version lives in the **Encyclopedia** tab inside the
+application. A short reference:
 
 | Term | Meaning |
 |---|---|
@@ -648,7 +697,7 @@ everywhere it appears.
 
 ---
 
-## 14. Polling strategy and rate limits
+## 14. Polling, rate limits and being a good citizen
 
 The daemon polls on a configurable interval of 15, 30, 45 or 60 minutes,
 defaulting to 30. The interval is re-read from storage at the top of every
@@ -671,25 +720,52 @@ That means a missed cycle — a sleeping laptop, a dropped connection, a restart
 — costs nothing: the next poll re-covers the gap. The upsert is idempotent, so
 the overlap collapses.
 
-### Rate limiting
+### Being a good citizen of someone else's free service
 
-All outbound requests pass through a **shared token bucket**: 2 requests per
-second sustained, burst of 4. Because the bucket is shared across every
-coroutine on the single event loop, parallel work cannot collectively exceed
-the limit.
+These providers cost nothing and ask nothing. That makes it entirely this
+application's responsibility not to abuse them. A single global token bucket —
+what the project started with — is not sufficient, because three different
+things can go wrong and each needs its own mechanism:
 
-### Backoff, and where it belongs
+| Layer | Bounds | Why a bucket alone cannot do it |
+|---|---|---|
+| **Budget** | requests per hour and per UTC day, per provider | A rate limit cannot see a *quota*. Open-Meteo's free tier is a daily allowance, and exceeding it is how a self-hosted app quietly stops working after lunch. |
+| **Semaphore** | requests in flight, per provider | A 2/s limit happily allows ten simultaneous slow queries, which then occupy ten of a research server's worker threads at once. |
+| **Bucket** | requests per second, per provider | The instantaneous rate is what looks like an attack and gets an IP blocked. |
+| **Backoff** | spacing between retries | Full jitter, so every client that lost the same outage does not retry in lockstep and recreate it. |
 
-Failures retry with exponential backoff and **full jitter** — without jitter,
-every client that lost the same outage retries in lockstep and recreates it.
+Limits are **per provider**, because they are not alike. Open-Meteo is a fast,
+CDN-fronted API; ERDDAP is a single NOAA research server that takes seconds to
+answer one query and publishes no numeric limit at all, only a request that
+clients be considerate. Sharing one limiter between them would mean choosing
+between being needlessly slow with one and needlessly harsh on the other.
 
-Backoff depth is per-call, and callers with a fallback lower it. This was not a
-theoretical concern: because a reloading ERDDAP dataset is classified
-transient, the first implementation spent minutes backing off against a broken
-variant before ever trying the working one. ERDDAP fetches now run a fast pass
-of one attempt per variant, and only if *every* variant fails does a patient
-pass with full backoff begin. One dead mirror costs seconds; a real outage
-still gets patience.
+| Provider | Our limit | Their published limit |
+|---|---|---|
+| Open-Meteo | 2/s, burst 4, 2 concurrent, **3,000/day**, 600/hour | 10,000/day, 5,000/hour, 600/minute |
+| NOAA ERDDAP | 1/s, burst 2, **1 concurrent**, 1,500/day, 200/hour | none published; asks clients to be considerate |
+| Bulk downloads (WPI, GeoNames) | 1/s, 1 concurrent, 50/day | fetched once at setup |
+
+Every self-imposed cap sits an order of magnitude inside the provider's ceiling.
+In normal operation a 250-point grid plus a handful of tracked ports costs
+roughly **300–600 Open-Meteo calls a day** — batched at 100 coordinates per
+request, because one request per point would be 24,000 calls and blow the
+allowance before dinner.
+
+**The budget is persisted.** Counters live in the database, not in memory, so a
+restart — or a crash loop — cannot reset a provider's daily quota and let the
+app hammer a service it has already used up. Current usage is shown in the
+status bar, per provider, with the provider's own published limit in the
+tooltip.
+
+**Other courtesies.** Conditional `GET` with `If-Modified-Since` and `If-None-Match`
+so unchanged payloads cost nothing; `Retry-After` honoured when a provider sends
+one, capped at two minutes so a coroutine is not held open for an hour; a
+bounded connection pool (4 sockets); and a `User-Agent` that identifies the
+software so an operator can see who is calling.
+
+An exhausted budget is reported and **not retried** — waiting would not help,
+and stopping is the entire point.
 
 ### The heartbeat
 
@@ -751,10 +827,26 @@ for every day of it.
 This is not hypothetical — it was the observed behaviour during verification,
 and it made sea temperature and sea level come back empty for exactly the
 coastal ports the application exists to examine, in a way indistinguishable
-from a broken fetch. Each dataset therefore probes a ten-day window outward
-from the requested point, nearest candidate first, up to 1.5°, and caches the
-result. For Rotterdam it relocates from 51.900, 4.233 to 51.900, 3.983 and the
-data appears.
+from a broken fetch.
+
+**One request, not a walk.** griddap can subset a *range* of latitudes and
+longitudes, so the whole neighbourhood arrives in a single query and the nearest
+cell holding a value is chosen locally. The first implementation probed up to 33
+candidate points one at a time; at several seconds per ERDDAP round trip that
+cost two to four minutes per port, and it repeated on every timeline load.
+Measured before and after, for Mumbai:
+
+| | Before | After |
+|---|---|---|
+| Sea temperature cell | 77 s | **2.2 s** |
+| Sea level cell | ~4 min | **1.1 s** |
+| Second load (same port) | same again | **0.000 s** |
+
+The resolved cell is cached in memory *and* on disk — a masked coastline does
+not move, so this is paid once per port per dataset and never again. Dataset
+coverage bounds are cached the same way, with a six-hour expiry, instead of
+being rediscovered on every load. For Rotterdam the lookup relocates from
+51.900, 4.233 to 51.875, 3.875 and the data appears.
 
 ### The cache ledger
 
@@ -1054,7 +1146,7 @@ Other properties worth noting:
 
 ## 24. Testing
 
-**115 tests, all offline.** They need no network and never touch your real data
+**126 tests, all offline.** They need no network and never touch your real data
 directory — every test runs against a temporary database.
 
 ```bash
@@ -1065,9 +1157,9 @@ directory — every test runs against a temporary database.
 | File | Tests | Focus |
 |---|---|---|
 | `test_gazetteer.py` | 33 | DMS parsing, coastal filtering, FTS index population, query escaping against hostile input, ranking, population enrichment |
-| `test_ingest.py` | 26 | Token bucket, batch parsing, all-null land detection, archive-floor clamping, griddap CSV shape, masked-cell resolution, chunk boundaries, containment |
+| `test_ingest.py` | 32 | Per-provider buckets, persisted request budget, batch parsing, all-null land detection, archive-floor clamping, griddap CSV shape, single-request masked-cell resolution and its persistence, chunk boundaries, containment |
 | `test_storage.py` | 18 | Source-scoped merging, SST precedence, flag latching, true-distance radius, antimeridian wrap, ledger containment |
-| `test_export.py` | 15 | Gap-fill semantics, schema stability, Parquet round-trip, CSV timezone text |
+| `test_export.py` | 20 | Gap-fill semantics, schema stability, Parquet round-trip, CSV timezone text, bundle contents, data-dictionary coverage, measured-vs-modelled provenance, opt-in derived features |
 | `test_math_engine.py` | 14 | Wave power, circular means, LTTB shape preservation, rolling z-scores, resampling |
 | `test_models.py` | 9 | All-null rejection, longitude wrapping, NaN handling, identity |
 
@@ -1099,7 +1191,8 @@ src/oceanpulse/
     build.py                  WPI DMS parsing, coastal filtering, FTS5 builder
     store.py                  search, ranking, query escaping
   ingest/
-    http.py                   token bucket, backoff, error classification
+    http.py                   per-provider gating, backoff, error classification
+    limits.py                 provider limits, semaphores, persisted request budget
     open_meteo.py             batched marine fetches, archive floors
     noaa_erddap.py            variant failover, masked-cell resolution
     grid.py                   ocean mask, equal-area grid
@@ -1108,16 +1201,18 @@ src/oceanpulse/
     runner.py                 the single shared event loop
     daemon.py                 the polling loop
   exporting/
-    aggregate.py              resampling, gap filling, CSV/Parquet
+    aggregate.py              resampling, gap filling, derived features, CSV/Parquet
+    manifest.py               data dictionary, manifest, README, zip bundle
   ui/
     app.py, theme.py, services.py, place_search.py
-    tab_pulse.py, tab_timeline.py, tab_analytics.py, tab_export.py
+    content.py                encyclopedia and glossary content
+    tab_pulse.py, tab_timeline.py, tab_analytics.py, tab_export.py, tab_learn.py
 
 scripts/                      gazetteer builder, service install/uninstall
-tests/                        115 offline tests
+tests/                        126 offline tests
 ```
 
-About 8,800 lines of Python.
+About 12,000 lines of Python.
 
 ---
 

@@ -275,6 +275,7 @@ def register(app: Any, services: Services) -> None:
                     start_date,
                     end_date,
                     include_erddap="erddap" in (sources or []),
+                    erddap=services.erddap,
                 ),
                 timeout=600.0,
             )
